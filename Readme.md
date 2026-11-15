@@ -18,10 +18,12 @@ Le projet explore cette question avec un encodeur **sans convolution** (Vision T
 ## Méthode
 
 ```
-1 image / classe
+1 image / classe (PNG détouré, RGBA)
       │
-      ├─► transformation de couleur   (teinte, saturation, canaux, contraste…)
-      ├─► déformation géométrique     (affine + champ élastique, sans découpage)
+      ├─► échange de palette entre classes   (le chat reçoit les couleurs du chien…)
+      ├─► transformation de couleur          (teinte, saturation, canaux, contraste…)
+      ├─► déformation géométrique            (affine + champ élastique, sans découpage)
+      ├─► vues locales                       (zoom sur une partie de l'objet)
       ├─► fond aléatoire, bruit, occlusion
       ▼
   Encodeur ViT (from scratch)
@@ -35,12 +37,15 @@ Le projet explore cette question avec un encodeur **sans convolution** (Vision T
 
 | Composant | Détail |
 |---|---|
-| **Encodeur** | ViT minimal : patchs via `unfold` + couche `Linear` (aucun `Conv2d`), 4 blocs, dimension 128 (≈ 0,6 M de paramètres) |
-| **Couleur** | Rotation de teinte (espace YIQ), saturation, permutation des canaux, contraste, luminosité, niveaux de gris |
+| **Encodeur** | ViT minimal : patchs via `unfold` + couche `Linear` (aucun `Conv2d`), 4 blocs, dimension 128 (≈ 0,59 M de paramètres) |
+| **Couleur** | Rotation de teinte (espace YIQ), saturation, permutation des canaux, contraste, luminosité, niveaux de gris (rare) |
+| **Échange de palette** | Les statistiques couleur (moyenne, écart-type par canal) d'une classe sont appliquées à l'autre : la couleur ne peut plus servir d'indice de classe |
 | **Géométrie** | Transformation affine aléatoire + champ de déformation élastique lisse (grille 4×4 interpolée en bicubique). La forme est déformée, jamais découpée |
-| **Fond** | Remplacement par des fonds aléatoires (si l'image d'entraînement est un PNG RGBA avec transparence) |
+| **Vues locales** | Zoom ×1,5 à ×2,6 centré sur un pixel de l'objet (tiré selon le masque alpha) : force l'apprentissage de features de parties (oreille, pelage, museau) |
+| **Fond** | Fonds aléatoires pour les PNG transparents ; padding par **réflexion** pour les images opaques (évite des bordures artificielles jamais vues au test) |
+| **Vues propres** | 10 % des échantillons d'entraînement ne sont pas augmentés, pour réduire l'écart train/test |
 | **Perte** | *Supervised Contrastive Loss* : les variantes d'une même classe sont rapprochées, les classes distinctes sont éloignées |
-| **Évaluation** | Prototype de classe = moyenne des embeddings de variantes augmentées ; classification par similarité cosinus |
+| **Évaluation** | Prototype de classe = moyenne des embeddings de vues augmentées + embedding de l'image propre ; classification par similarité cosinus |
 
 Le script évalue deux couches : la représentation du **backbone** et le vecteur **latent** projeté.
 
@@ -50,85 +55,156 @@ Le script évalue deux couches : la représentation du **backbone** et le vecteu
 git clone https://github.com/gbelsalvador/one-shot-latent.git
 cd one-shot-latent
 pip install torch numpy pillow
+pip install "rembg[cpu]"      # uniquement pour détourer les images (remove_bg.py)
 ```
 
 ## Utilisation
 
 ### 1. Préparer les données
 
+Place tes images d'origine dans `data_raw/` :
+
 ```
-data/
+data_raw/
 ├── train/
-│   ├── cat.png        # le nom du fichier = nom de la classe
-│   └── dog.png
+│   ├── chat.jpg           # le nom du fichier = nom de la classe
+│   └── chien.jpg
 └── test/
-    ├── cat/           # images de test de la classe « cat »
-    │   ├── 01.jpg
-    │   └── ...
-    └── dog/
-        ├── 01.jpg
-        └── ...
+    ├── chat/              # images de test de la classe « chat »
+    │   ├── 01.jpg ...
+    └── chien/
+        ├── 01.jpg ...
 ```
 
-> **Conseil :** utilise des PNG avec **fond transparent** (RGBA) pour l'entraînement. Le code remplace alors le fond par des fonds aléatoires, ce qui évite que le modèle apprenne l'arrière-plan au lieu de l'animal. Avec un JPG, le fond d'origine reste collé à l'objet.
+### 2. Détourer les fonds
 
-### 2. Lancer l'entraînement
+Avec 2 images d'entraînement, le fond est un raccourci très tentant pour le modèle (voir [Constats](#constats-préliminaires-v1)). `remove_bg.py` détoure l'animal avec `rembg` et le recadre dans un carré transparent. Il conserve l'arborescence (`chat/`, `chien/`).
 
 ```bash
-python one_shot_latent.py --train_dir data/train --test_dir data/test
+python remove_bg.py --inp data_raw/train --out data/train
+python remove_bg.py --inp data_raw/test  --out data/test
 ```
 
-### Options principales
+> Au premier lancement, `rembg` télécharge un modèle d'environ 176 Mo (la barre de progression peut afficher une vitesse absurde : c'est un défaut d'affichage). Vérifie visuellement quelques PNG générés : l'animal doit être entier, sur fond transparent.
+
+### 3. Entraîner
+
+```bash
+# Test rapide + aperçu des augmentations
+python one_shot_latent.py --train_dir data/train --test_dir data/test --steps 100 --seeds 0
+
+# Expérience complète (5 graines, moyenne ± écart-type)
+python one_shot_latent.py --train_dir data/train --test_dir data/test --seeds 0 1 2 3 4
+```
+
+**Regarde toujours `runs_v2/seed0/aug_preview.png` avant de lancer une longue expérience** : l'animal doit apparaître sur des fonds variés, avec des vues locales, sans artefacts évidents.
+
+### Protocoles d'évaluation
+
+| Protocole | Train | Test | Commande |
+|---|---|---|---|
+| **A : objet seul** | détouré | détouré | `--test_dir data/test` |
+| **B : scène réelle** | détouré | images originales avec fond | `--test_dir data/test_raw` (copie de `data_raw/test`) |
+
+L'écart entre A et B mesure à quel point le fond gêne encore le modèle. Rapporte les deux.
+
+### Ablations
+
+Chaque augmentation peut être désactivée individuellement :
+
+```bash
+python one_shot_latent.py --no_swap  --seeds 0 1 2 3 4 --out runs_noswap
+python one_shot_latent.py --no_local --seeds 0 1 2 3 4 --out runs_nolocal
+```
+
+### Options
 
 | Option | Défaut | Description |
 |---|---|---|
-| `--size` | 64 | Taille des images (carrées) |
-| `--patch` | 8 | Taille des patchs du ViT |
+| `--seeds` | `0` | Liste de graines ; le résumé donne moyenne ± écart-type |
+| `--no_color` / `--no_geo` / `--no_bg` / `--no_local` / `--no_swap` | – | Désactive une augmentation (ablation) |
+| `--p_local` | 0.4 | Probabilité d'une vue locale |
+| `--elastic_sigma` | 0.10 | Amplitude de la déformation élastique |
+| `--clean_frac` | 0.1 | Fraction de vues non augmentées |
+| `--size` / `--patch` | 64 / 8 | Taille des images et des patchs |
 | `--dim` / `--depth` / `--heads` | 128 / 4 / 4 | Taille du ViT |
-| `--steps` | 1500 | Nombre de pas d'entraînement |
-| `--views` | 64 | Variantes générées par classe et par pas |
-| `--temp` | 0.1 | Température de la perte contrastive |
-| `--lr` | 3e-4 | Taux d'apprentissage |
-| `--eval_every` | 250 | Fréquence d'évaluation |
-| `--seed` | 0 | Graine aléatoire |
-| `--out` | `runs` | Dossier de sortie |
+| `--steps` | 1500 | Pas d'entraînement |
+| `--views` | 64 | Variantes par classe et par pas |
+| `--temp` / `--lr` | 0.1 / 3e-4 | Température SupCon / taux d'apprentissage |
+| `--eval_every` | 500 | Fréquence d'évaluation |
+| `--out` | `runs_v2` | Dossier de sortie |
 
 ### Sorties
 
-- `runs/aug_preview.png` : aperçu des augmentations (à regarder avant tout entraînement)
-- `runs/model.pt` : poids du modèle
-- Console : perte et accuracy (backbone et latent), avec la baseline d'un réseau non entraîné au pas 0
+- `runs_v2/seed<N>/aug_preview.png` : aperçu des augmentations
+- `runs_v2/seed<N>/model.pt` : poids du modèle
+- `runs_v2/summary.json` : baseline et résultats finaux, moyenne ± écart-type
+- Console : perte, accuracy (backbone et latent) et baseline d'un réseau non entraîné
 
-## Résultats
+## Constats préliminaires (v1)
 
-> ⚠️ **À compléter.** Remplir avec tes mesures. Répéter chaque expérience sur plusieurs graines (par exemple 5) et reporter la moyenne ± l'écart-type : avec peu d'images de test, un seul run n'est pas significatif.
+La première version (images JPG avec fond, augmentations plus agressives, une seule graine, 23 images de test) a donné ceci :
 
-| Expérience | Accuracy backbone | Accuracy latent |
+| Étape | Accuracy backbone | Accuracy latent |
 |---|---|---|
-| Baseline (réseau non entraîné) | – | – |
-| Modèle complet | – | – |
-| Sans augmentation de couleur | – | – |
-| Sans déformation géométrique | – | – |
-| Sans fond aléatoire | – | – |
+| Réseau non entraîné | 60,9 % | 65,2 % |
+| Après 1500 pas | 52,2 % | 52,2 % |
 
-**Protocole de test :** 1 image d'entraînement par classe, N images de test par classe , images redimensionnées en 64×64.
+Deux observations :
+
+1. **La loss atteint son minimum théorique** (≈ 4,143 = ln(63) pour 64 vues par classe) dès quelques centaines de pas, puis stagne : avec deux images, la tâche contrastive est résolue par des indices triviaux (fond, silhouette exacte) qui ne se transfèrent pas à de nouvelles images.
+2. **L'accuracy est au niveau du hasard** (52 %). Avec 23 images de test, l'incertitude est d'environ ±10 points : la baseline à 60-65 % n'est pas significativement différente.
+
+L'aperçu des augmentations a aussi révélé que le fond d'origine restait collé à l'objet, que certaines vues étaient quasi détruites (sombres, floues, bruitées) et que des bordures colorées apparaissaient à l'entraînement sans jamais exister au test. La v2 corrige ces points (détourage, augmentations plus douces, padding par réflexion, vues propres) et ajoute les vues locales et l'échange de palette pour rendre la tâche moins triviale.
+
+## Résultats (v2)
+
+
+| Expérience | Protocole | Accuracy backbone | Accuracy latent |
+|---|---|---|---|
+| Baseline (réseau non entraîné) | A | – | – |
+| Modèle complet | A | – | – |
+| Modèle complet | B | – | – |
+| `--no_color` | A | – | – |
+| `--no_geo` | A | – | – |
+| `--no_bg` | A | – | – |
+| `--no_local` | A | – | – |
+| `--no_swap` | A | – | – |
+
+**Protocole de test :** 1 image d'entraînement par classe, N images de test par classe (à préciser), images redimensionnées en 64×64.
 
 ## Limites
 
 - Testé uniquement sur un problème binaire (chat / chien), avec un petit nombre d'images de test.
-- Les augmentations apprennent l'invariance à la couleur et à la déformation, mais **pas la variabilité sémantique** (races, poses, point de vue) que seule une image ne contient pas.
-- La déformation est appliquée à l'image entière : la forme n'est pas extraite explicitement (pas de segmentation).
+- Les augmentations apprennent l'invariance à la couleur et à la déformation, mais **pas la variabilité sémantique** (races, poses, point de vue) que deux images ne contiennent pas.
+- La qualité du détourage (`rembg`) influence directement les résultats ; les erreurs de segmentation ne sont pas corrigées.
+- La déformation est appliquée à l'image entière : la forme n'est pas extraite explicitement comme primitive géométrique.
 - Une déformation élastique trop forte peut replier l'objet et produire des images non réalistes.
 - Aucune comparaison à des baselines pré-entraînées (CLIP, DINOv2) pour l'instant.
 
 ## Pistes de recherche
 
-- [ ] Ablations systématiques (couleur, géométrie, fond, taille du ViT)
+- [x] Ablations par augmentation (`--no_*`) et évaluation multi-graines
+- [ ] Étudier la taille minimale de test nécessaire pour détecter un effet significatif
 - [ ] Extraction explicite de la forme (superpixels, segmentation) et **réseau de graphes** (GNN)
 - [ ] Capsule Networks et réseaux équivariants
 - [ ] Plus de classes et d'autres jeux de données (CIFAR, Oxford-IIIT Pets)
-- [ ] Comparaison avec un encodeur pré-entraîné (CLIP, DINOv2)
+- [ ] Comparaison avec un encodeur pré-entraîné (CLIP, DINOv2) comme borne haute
 - [ ] Augmentations apprises (déformations générées par un réseau)
+
+## Structure du dépôt
+
+```
+one-shot-latent/
+├── one_shot_latent.py   # entraînement + évaluation (v2)
+├── remove_bg.py         # détourage des fonds (rembg)
+├── data_raw/            # images originales (non versionnées)
+├── data/                # images détourées (non versionnées)
+├── runs_v2/             # sorties
+└── README.md
+```
+
+
 
 ## Travaux liés
 
@@ -136,6 +212,7 @@ python one_shot_latent.py --train_dir data/train --test_dir data/test
 - Khosla et al., *Supervised Contrastive Learning*
 - Dosovitskiy et al., *An Image is Worth 16x16 Words* (ViT)
 - Sabour et al., *Dynamic Routing Between Capsules*
+- Gatis, *rembg* (détourage de fond)
 
 ## Citation
 
@@ -144,7 +221,7 @@ python one_shot_latent.py --train_dir data/train --test_dir data/test
   title  = {one-shot-latent: One-image-per-class learning with a CNN-free ViT},
   author = {gedeon banyi bantu},
   year   = {2026},
-  url    = {https://github.com/<ton-utilisateur>/one-shot-latent}
+  url    = {https://github.com/gbelsalvador/one-shot-latent}
 }
 ```
 
